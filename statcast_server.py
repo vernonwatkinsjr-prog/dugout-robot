@@ -48,6 +48,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import time, threading
 import pandas as pd
+import requests
 
 try:
     import pybaseball as pyb
@@ -89,6 +90,101 @@ def _f(v):
         return float(v)
     except Exception:
         return None
+
+
+# ---- FanGraphs via its modern JSON API (the page pybaseball scrapes now 403s) ----
+FG_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.fangraphs.com/leaders/major-league",
+}
+
+
+def _fg_api(stats, season, type_):
+    """stats='bat'|'pit'. Returns the list of row dicts from FanGraphs' leaders API."""
+    url = ("https://www.fangraphs.com/api/leaders/major-league/data"
+           f"?pos=all&stats={stats}&lg=all&qual=0&type={type_}"
+           f"&season={season}&season1={season}&month=0&team=0&ind=0"
+           "&pageitems=2000000000&pagenum=1")
+    r = requests.get(url, headers=FG_HEADERS, timeout=90)
+    r.raise_for_status()
+    j = r.json()
+    if isinstance(j, dict):
+        return j.get("data") or j.get("rows") or []
+    return j if isinstance(j, list) else []
+
+
+def _row_mlbam(row, fmap):
+    for k in ("xMLBAMID", "MLBAMID", "mlbamid", "mlbam", "key_mlbam"):
+        if k in row and row[k] not in (None, ""):
+            try:
+                return str(int(row[k]))
+            except Exception:
+                pass
+    for k in ("playerid", "PlayerId", "playerId", "IDfg"):
+        if k in row and row[k] not in (None, ""):
+            return fmap.get(str(row[k]).strip())
+    return None
+
+
+def _pickv(row, *pats):
+    for k in row:
+        if str(k).lower() in pats:
+            return row[k]
+    for k in row:
+        kl = str(k).lower()
+        for p in pats:
+            if p in kl:
+                return row[k]
+    return None
+
+
+def _has(row, *keys):
+    low = {str(k).lower() for k in row}
+    return any(k in low for k in keys)
+
+
+def _fg_fallback_map(rows):
+    """Only needed if rows lack xMLBAMID: map FanGraphs id -> MLBAM via Chadwick."""
+    if any(("xMLBAMID" in r and r.get("xMLBAMID")) for r in rows[:5]):
+        return {}
+    ids = []
+    for r in rows:
+        for k in ("playerid", "PlayerId", "IDfg"):
+            if k in r and r[k] not in (None, ""):
+                try:
+                    ids.append(int(r[k]))
+                except Exception:
+                    pass
+                break
+    out = {}
+    if pyb is None or not ids:
+        return out
+    try:
+        rev = pyb.playerid_reverse_lookup(list(set(ids)), key_type="fangraphs")
+        cF = _find(rev, "key_fangraphs")
+        cM = _find(rev, "key_mlbam")
+        for _, rr in rev.iterrows():
+            if cF and cM and not pd.isna(rr[cF]) and not pd.isna(rr[cM]):
+                out[str(int(rr[cF]))] = str(int(rr[cM]))
+    except Exception as e:
+        LAST["errors"]["fg_fallback_map"] = repr(e)
+    return out
+
+
+def _fg_collect(stats, season):
+    """Pull batted-ball + plate-discipline dashboards and return merged rows.
+    Tries several `type` ids; context guards (below) pick the right field, so a
+    wrong type id just yields nothing rather than a wrong value."""
+    rows = []
+    for t in (3, 7, 2, 5):
+        try:
+            rows += _fg_api(stats, season=season, type_=t)
+        except Exception as e:
+            LAST["errors"].setdefault(f"fg_{stats}_type{t}", repr(e))
+    return rows
+
 
 
 def _pct(v):
@@ -158,30 +254,33 @@ def build(season):
     except Exception as e:
         print("batter exitvelo_barrels failed:", e)
 
-    # FanGraphs batting: FB%, SwStr%, Pitches (mapped IDfg -> MLBAM)
+    # FanGraphs batting via JSON API: FB% (fly ball), SwStr%, Pitches
     try:
-        fg = pyb.batting_stats(season, qual=1)
-        cFB  = _find(fg, "fb%", "fb_pct", "flyball%")
-        cSW  = _find(fg, "swstr%", "swstr_pct", "swinging strike%")
-        cP   = _find(fg, "pitches", "pitch count", "# pitches")
-        fg2mlbam, cID = _fg_map(fg)
-        n = 0
-        for _, r in fg.iterrows():
-            raw = r.get(cID) if cID else None
-            pid = fg2mlbam.get(int(raw)) if (raw is not None and not pd.isna(raw)) else None
+        rows = _fg_collect("bat", season)
+        fmap = _fg_fallback_map(rows)
+        nb = 0
+        for row in rows:
+            pid = _row_mlbam(row, fmap)
             if not pid:
                 continue
             d = eb(pid)
-            if cFB:
-                d["fb"] = _pct(r.get(cFB))
-            if cSW:
-                d["swstr"] = _pct(r.get(cSW))
-            if cP:
-                p = r.get(cP)
-                d["pitches"] = None if (p is None or pd.isna(p)) else int(p)
-            n += 1
-        LAST["counts"]["fg_batting_matched"] = n
-        LAST["counts"]["fg_batting_cols"] = {"fb": cFB, "swstr": cSW, "pitches": cP}
+            # FB% only from a batted-ball context (guard against fastball% in pitch-type tabs)
+            if _has(row, "gb%", "ld%"):
+                v = _pickv(row, "fb%")
+                if v is not None:
+                    d["fb"] = _pct(v); nb += 1
+            # SwStr%/Pitches only from a plate-discipline context
+            if _has(row, "o-swing%", "contact%", "swstr%"):
+                sw = _pickv(row, "swstr%")
+                if sw is not None:
+                    d["swstr"] = _pct(sw)
+                pit = _pickv(row, "pitches")
+                if pit is not None:
+                    try:
+                        d["pitches"] = int(float(pit))
+                    except Exception:
+                        pass
+        LAST["counts"]["fg_batting_matched"] = nb
     except Exception as e:
         LAST["errors"]["fangraphs_batting"] = repr(e)
         print("fangraphs batting failed:", e)
@@ -219,33 +318,34 @@ def build(season):
     except Exception as e:
         print("pitcher exitvelo_barrels failed:", e)
 
-    # FanGraphs pitching: SwStr%, FB%, CSW%, Pitches (mapped IDfg -> MLBAM)
+    # FanGraphs pitching via JSON API: FB% (fly ball allowed), SwStr%, CSW%, Pitches
     try:
-        pg = pyb.pitching_stats(season, qual=1)
-        cSW  = _find(pg, "swstr%", "swstr_pct")
-        cFB  = _find(pg, "fb%", "flyball%")
-        cCSW = _find(pg, "csw%", "csw")
-        cP   = _find(pg, "pitches", "# pitches")
-        pg2mlbam, cID = _fg_map(pg)
-        n = 0
-        for _, r in pg.iterrows():
-            raw = r.get(cID) if cID else None
-            pid = pg2mlbam.get(int(raw)) if (raw is not None and not pd.isna(raw)) else None
+        rows = _fg_collect("pit", season)
+        fmap = _fg_fallback_map(rows)
+        nb = 0
+        for row in rows:
+            pid = _row_mlbam(row, fmap)
             if not pid:
                 continue
             d = ep(pid)
-            if cSW:
-                d["swstr"] = _pct(r.get(cSW))
-            if cFB:
-                d["fb"] = _pct(r.get(cFB))
-            if cCSW:
-                d["csw"] = _pct(r.get(cCSW))
-            if cP:
-                p = r.get(cP)
-                d["pitches"] = None if (p is None or pd.isna(p)) else int(p)
-            n += 1
-        LAST["counts"]["fg_pitching_matched"] = n
-        LAST["counts"]["fg_pitching_cols"] = {"swstr": cSW, "fb": cFB, "csw": cCSW, "pitches": cP}
+            if _has(row, "gb%", "ld%"):
+                v = _pickv(row, "fb%")
+                if v is not None:
+                    d["fb"] = _pct(v); nb += 1
+            if _has(row, "o-swing%", "contact%", "swstr%", "csw%"):
+                sw = _pickv(row, "swstr%")
+                if sw is not None:
+                    d["swstr"] = _pct(sw)
+                csw = _pickv(row, "csw%")
+                if csw is not None:
+                    d["csw"] = _pct(csw)
+                pit = _pickv(row, "pitches")
+                if pit is not None:
+                    try:
+                        d["pitches"] = int(float(pit))
+                    except Exception:
+                        pass
+        LAST["counts"]["fg_pitching_matched"] = nb
     except Exception as e:
         LAST["errors"]["fangraphs_pitching"] = repr(e)
         print("fangraphs pitching failed:", e)

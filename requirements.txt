@@ -2,4 +2,5 @@ flask
 flask-cors
 pybaseball
 pandas
+requests
 gunicorn

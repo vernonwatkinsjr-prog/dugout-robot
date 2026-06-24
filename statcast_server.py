@@ -62,6 +62,23 @@ CORS(app)  # allow any origin; restrict with CORS(app, origins=["https://yoursit
 _CACHE = {}            # season -> {"ts": float, "data": dict}
 _TTL = 6 * 3600        # refresh every 6 hours
 _LOCK = threading.Lock()
+LAST = {"errors": {}, "counts": {}}   # diagnostics surfaced by /health
+
+
+def _find(df, *cands):
+    """Return the first column whose name matches any candidate (case-insensitive,
+    exact then 'contains'). FanGraphs/Savant rename columns between versions, so we
+    don't hard-code a single spelling."""
+    cols = list(df.columns)
+    low = {str(c).strip().lower(): c for c in cols}
+    for cand in cands:
+        if cand.lower() in low:
+            return low[cand.lower()]
+    for cand in cands:
+        for lc, orig in low.items():
+            if cand.lower() in lc:
+                return orig
+    return None
 
 
 def _f(v):
@@ -144,17 +161,29 @@ def build(season):
     # FanGraphs batting: FB%, SwStr%, Pitches (mapped IDfg -> MLBAM)
     try:
         fg = pyb.batting_stats(season, qual=1)
-        fg2mlbam = _fg_map(fg)
+        cFB  = _find(fg, "fb%", "fb_pct", "flyball%")
+        cSW  = _find(fg, "swstr%", "swstr_pct", "swinging strike%")
+        cP   = _find(fg, "pitches", "pitch count", "# pitches")
+        fg2mlbam, cID = _fg_map(fg)
+        n = 0
         for _, r in fg.iterrows():
-            pid = fg2mlbam.get(int(r["IDfg"])) if not pd.isna(r.get("IDfg")) else None
+            raw = r.get(cID) if cID else None
+            pid = fg2mlbam.get(int(raw)) if (raw is not None and not pd.isna(raw)) else None
             if not pid:
                 continue
             d = eb(pid)
-            d["fb"]      = _pct(r.get("FB%"))
-            d["swstr"]   = _pct(r.get("SwStr%"))
-            p = r.get("Pitches")
-            d["pitches"] = None if (p is None or pd.isna(p)) else int(p)
+            if cFB:
+                d["fb"] = _pct(r.get(cFB))
+            if cSW:
+                d["swstr"] = _pct(r.get(cSW))
+            if cP:
+                p = r.get(cP)
+                d["pitches"] = None if (p is None or pd.isna(p)) else int(p)
+            n += 1
+        LAST["counts"]["fg_batting_matched"] = n
+        LAST["counts"]["fg_batting_cols"] = {"fb": cFB, "swstr": cSW, "pitches": cP}
     except Exception as e:
+        LAST["errors"]["fangraphs_batting"] = repr(e)
         print("fangraphs batting failed:", e)
 
     # ===================== PITCHERS =====================
@@ -193,18 +222,32 @@ def build(season):
     # FanGraphs pitching: SwStr%, FB%, CSW%, Pitches (mapped IDfg -> MLBAM)
     try:
         pg = pyb.pitching_stats(season, qual=1)
-        pg2mlbam = _fg_map(pg)
+        cSW  = _find(pg, "swstr%", "swstr_pct")
+        cFB  = _find(pg, "fb%", "flyball%")
+        cCSW = _find(pg, "csw%", "csw")
+        cP   = _find(pg, "pitches", "# pitches")
+        pg2mlbam, cID = _fg_map(pg)
+        n = 0
         for _, r in pg.iterrows():
-            pid = pg2mlbam.get(int(r["IDfg"])) if not pd.isna(r.get("IDfg")) else None
+            raw = r.get(cID) if cID else None
+            pid = pg2mlbam.get(int(raw)) if (raw is not None and not pd.isna(raw)) else None
             if not pid:
                 continue
             d = ep(pid)
-            d["swstr"]   = _pct(r.get("SwStr%"))
-            d["fb"]      = _pct(r.get("FB%"))
-            d["csw"]     = _pct(r.get("CSW%"))
-            p = r.get("Pitches")
-            d["pitches"] = None if (p is None or pd.isna(p)) else int(p)
+            if cSW:
+                d["swstr"] = _pct(r.get(cSW))
+            if cFB:
+                d["fb"] = _pct(r.get(cFB))
+            if cCSW:
+                d["csw"] = _pct(r.get(cCSW))
+            if cP:
+                p = r.get(cP)
+                d["pitches"] = None if (p is None or pd.isna(p)) else int(p)
+            n += 1
+        LAST["counts"]["fg_pitching_matched"] = n
+        LAST["counts"]["fg_pitching_cols"] = {"swstr": cSW, "fb": cFB, "csw": cCSW, "pitches": cP}
     except Exception as e:
+        LAST["errors"]["fangraphs_pitching"] = repr(e)
         print("fangraphs pitching failed:", e)
 
     # columns we can't source cleanly yet -> explicit null so the page shows "—"
@@ -218,19 +261,27 @@ def build(season):
 
 
 def _fg_map(df):
-    """Map FanGraphs IDfg -> MLBAM player id for a stats dataframe."""
+    """Map FanGraphs id -> MLBAM player id. Returns (mapping, id_column_name)."""
+    cID = _find(df, "idfg", "playerid", "fangraphs id")
+    if not cID:
+        LAST["errors"]["fg_map"] = "no FanGraphs id column found"
+        return {}, None
     try:
-        idfg = [int(x) for x in df["IDfg"].dropna().unique()]
+        idfg = [int(x) for x in df[cID].dropna().unique()]
         rev = pyb.playerid_reverse_lookup(idfg, key_type="fangraphs")
+        cF = _find(rev, "key_fangraphs")
+        cM = _find(rev, "key_mlbam")
         out = {}
         for _, r in rev.iterrows():
-            if pd.isna(r.get("key_fangraphs")) or pd.isna(r.get("key_mlbam")):
+            if cF is None or cM is None or pd.isna(r.get(cF)) or pd.isna(r.get(cM)):
                 continue
-            out[int(r["key_fangraphs"])] = str(int(r["key_mlbam"]))
-        return out
+            out[int(r[cF])] = str(int(r[cM]))
+        LAST["counts"]["fg_id_mapped"] = len(out)
+        return out, cID
     except Exception as e:
+        LAST["errors"]["fg_map"] = repr(e)
         print("id map failed:", e)
-        return {}
+        return {}, cID
 
 
 def get_season(season):
@@ -256,8 +307,28 @@ def statcast():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "pybaseball": pyb is not None,
-                    "cached_seasons": list(_CACHE.keys())})
+    try:
+        season = int(request.args.get("season", 2026))
+    except Exception:
+        season = 2026
+    data = get_season(season)
+    b, p = data.get("batters", {}), data.get("pitchers", {})
+
+    def cov(d, key):
+        return sum(1 for v in d.values() if v.get(key) is not None)
+
+    return jsonify({
+        "ok": True,
+        "pybaseball": pyb is not None,
+        "season": season,
+        "batters": len(b),
+        "pitchers": len(p),
+        "batter_coverage": {k: cov(b, k) for k in
+            ["xwoba", "brlbip", "hh", "la", "sweetspot", "fb", "swstr", "pitches", "xwobacon", "pulledbrl"]},
+        "pitcher_coverage": {k: cov(p, k) for k in
+            ["xwoba", "brlbip", "hh", "swstr", "fb", "csw", "pitches"]},
+        "diagnostics": LAST,
+    })
 
 
 @app.route("/")
